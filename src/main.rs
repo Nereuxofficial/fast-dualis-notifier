@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use lambda_runtime::{service_fn, Error as LambdaError, LambdaEvent};
 use reqwest::header::HeaderMap;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::error::Error;
@@ -12,6 +12,8 @@ use urlencoding::encode;
 const USER: &str = include_str!("user.txt");
 const PASS: &str = include_str!("pass.txt");
 const WEBHOOK_URL: &str = include_str!("webhook.txt");
+// AWS Lambda wants us to use /tmp as storage directory
+const STORAGE: &str = "/tmp/";
 
 #[tokio::main]
 async fn main() -> Result<(), LambdaError> {
@@ -22,22 +24,32 @@ async fn main() -> Result<(), LambdaError> {
 
 async fn func(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     let (event, _context) = event.into_parts();
-    let semester_id = event["semester"].as_str().unwrap_or("-N000000015098000");
+    let semester_ids = event["semester"]
+        .as_str()
+        .unwrap_or("-N000000015098000,-N000000015088000,-N000000015108000,-N000000015118000")
+        .split(',');
     let client = Client::new();
     let (cookie, session) = get_session(client.clone()).await.unwrap();
-    let differences = get_differences(semester_id, &cookie, &session).await;
-    if let Some(difference) = &differences {
-        send_webhook(client, difference.as_str()).await;
+    let mut diffs = vec![];
+    for semester in semester_ids {
+        let differences = get_differences(semester, &cookie, &session).await;
+        if let Some(difference) = &differences {
+            send_webhook(client.clone(), difference.as_str()).await;
+            diffs.push(difference.clone());
+        }
     }
-    Ok(json!({ "message": format!("Classes changed: {:?}", differences) }))
+    Ok(json!({
+        "message": format!("Classes changed: {diffs:?}")
+    }))
 }
 
-async fn send_webhook(client: Client, class: &str) {
+async fn send_webhook(client: Client, class: &str) -> StatusCode {
     client
         .post(WEBHOOK_URL)
+        .header("Content-Type", "application/json")
         .body(
             r#"{
-  "content": null,
+  "content": " ",
   "embeds": [
     {
       "title": "Die Noten für <Fach> sind verfügbar!",
@@ -52,18 +64,35 @@ async fn send_webhook(client: Client, class: &str) {
         )
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .status()
 }
 
+/// It gets the new grades, gets the old grades, compares them, and saves the new grades
+///
+/// Arguments:
+///
+/// * `semester_id`: The ID of the semester you want to check.
+/// * `cookie`: The cookie that you get from the login request.
+/// * `session`: The session ID that you get from the login request.
+///
+/// Returns:
+///
+/// An Option containing the class with the new grade or None.
 async fn get_differences(semester_id: &str, cookie: &str, session: &str) -> Option<String> {
     let client = Client::new();
-    let new_grades = &get_grades(client, cookie, session, semester_id).await.expect("Failed to get new grades");
-    let old_grades = load_grades(semester_id).await.unwrap();
+    let new_grades = &get_grades(client, cookie, session, semester_id)
+        .await
+        .expect("Failed to get new grades");
+    let old_grades = load_grades(semester_id).await;
+    if !old_grades.is_ok() {
+        return None;
+    }
     let mut diff: Option<String> = None;
     new_grades
         .iter()
         .sorted()
-        .zip(old_grades.iter().sorted())
+        .zip(old_grades.unwrap().iter().sorted())
         .for_each(|(new, old)| {
             if new != old {
                 diff = Some(new.0.clone())
@@ -73,6 +102,16 @@ async fn get_differences(semester_id: &str, cookie: &str, session: &str) -> Opti
     diff
 }
 
+/// We send a POST request to the login page with our credentials and get a cookie and a session in
+/// return
+///
+/// Arguments:
+///
+/// * `client`: The client we created earlier
+///
+/// Returns:
+///
+/// A tuple of two strings. The first string is the cookie, the second string is the session.
 async fn get_session(client: Client) -> Result<(String, String), Box<dyn std::error::Error>> {
     let passwd = encode(PASS);
     let payload = format!("usrname={user}%40student.dhbw-mannheim.de&pass={passwd}&APPNAME=CampusNet&PRGNAME=LOGINCHECK&ARGUMENTS=clino%2Cusrname%2Cpass%2Cmenuno%2Cmenu_type%2Cbrowser%2Cplatform&clino=000000000000001&menuno=000324&menu_type=classic&browser=&platform=", user=USER, passwd=passwd);
@@ -164,6 +203,9 @@ enum HeaderType {
     Optional,
 }
 
+/// It creates a new `HeaderMap` and inserts some headers into it
+/// Use HeaderType::Optional for more legit looking requests.
+/// A HeaderMap with the given Header level
 fn get_headers(header_type: HeaderType) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if header_type == HeaderType::Optional {
@@ -204,18 +246,6 @@ fn get_headers(header_type: HeaderType) -> HeaderMap {
     headers
 }
 
-/// It opens a file with the name of the semester id, writes the grades to it, and returns an error if
-/// it fails
-///
-/// Arguments:
-///
-/// * `semester_id`: The id of the semester you want to save the grades for.
-/// * `grades`: A vector of tuples, where the first element is the course name and the second element is
-/// the grade.
-///
-/// Returns:
-///
-/// A Result<(), Box<dyn Error>>
 async fn save_grades(
     semester_id: &str,
     grades: &HashMap<String, Option<String>>,
@@ -223,7 +253,7 @@ async fn save_grades(
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
-        .open(format!("{}.json", semester_id))
+        .open(format!("{}{}.json", STORAGE, semester_id))
         .await
         .unwrap();
     file.write_all(serde_json::to_string(grades).unwrap().as_bytes())
@@ -234,9 +264,8 @@ async fn save_grades(
 async fn load_grades(semester_id: &str) -> Result<HashMap<String, Option<String>>, Box<dyn Error>> {
     let mut file = OpenOptions::new()
         .read(true)
-        .open(format!("{}.json", semester_id))
-        .await
-        .unwrap();
+        .open(format!("{}{}.json", STORAGE, semester_id))
+        .await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
     Ok(serde_json::from_str(&contents)?)
@@ -252,6 +281,11 @@ mod tests {
         let client = ClientBuilder::new().build().unwrap();
         let (cookie, session) = get_session(client).await.unwrap();
         println!("cookie: {} \n session: {}", cookie, session);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_send_webhook() {
+        assert_eq!(204, send_webhook(Client::new(), "Programmieren").await);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -4,3 +4,4 @@ Cargo.lock
 rust.zip
 *.json
 *.html
+src/*.txt
