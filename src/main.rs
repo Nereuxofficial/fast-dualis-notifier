@@ -1,25 +1,17 @@
-#[macro_use]
-extern crate lambda_runtime as lambda;
-#[macro_use]
-extern crate serde_derive;
-#[macro_use]
-extern crate log;
-extern crate simple_logger;
-
-
+use itertools::Itertools;
+use lambda_runtime::{service_fn, Error as LambdaError, LambdaEvent};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
-use tokio::fs::{File, OpenOptions};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::error::Error;
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use urlencoding::encode;
-use std::error::Error;
-use lambda_runtime::{service_fn, LambdaEvent, Error as LambdaError};
-use serde_json::{json, Value};
 
 const USER: &str = include_str!("user.txt");
 const PASS: &str = include_str!("pass.txt");
-
-
+const WEBHOOK_URL: &str = include_str!("webhook.txt");
 
 #[tokio::main]
 async fn main() -> Result<(), LambdaError> {
@@ -30,10 +22,57 @@ async fn main() -> Result<(), LambdaError> {
 
 async fn func(event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     let (event, _context) = event.into_parts();
-    let first_name = event["firstName"].as_str().unwrap_or("world");
-
-    Ok(json!({ "message": format!("Hello, {}!", first_name) }))
+    let semester_id = event["semester"].as_str().unwrap_or("-N000000015098000");
+    let client = Client::new();
+    let (cookie, session) = get_session(client.clone()).await.unwrap();
+    let differences = get_differences(semester_id, &cookie, &session).await;
+    if let Some(difference) = &differences {
+        send_webhook(client, difference.as_str()).await;
+    }
+    Ok(json!({ "message": format!("Classes changed: {:?}", differences) }))
 }
+
+async fn send_webhook(client: Client, class: &str) {
+    client
+        .post(WEBHOOK_URL)
+        .body(
+            r#"{
+  "content": null,
+  "embeds": [
+    {
+      "title": "Die Noten für <Fach> sind verfügbar!",
+      "description": "Gehe auf https://dualis.dhbw.de um deine Note zu erfahren",
+      "url": "https://dualis.dhbw.de",
+      "color": 16734296
+    }
+  ],
+  "attachments": []
+}"#
+            .replace("<Fach>", class),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn get_differences(semester_id: &str, cookie: &str, session: &str) -> Option<String> {
+    let client = Client::new();
+    let new_grades = &get_grades(client, cookie, session, semester_id).await.expect("Failed to get new grades");
+    let old_grades = load_grades(semester_id).await.unwrap();
+    let mut diff: Option<String> = None;
+    new_grades
+        .iter()
+        .sorted()
+        .zip(old_grades.iter().sorted())
+        .for_each(|(new, old)| {
+            if new != old {
+                diff = Some(new.0.clone())
+            }
+        });
+    save_grades(semester_id, &new_grades).await.unwrap();
+    diff
+}
+
 async fn get_session(client: Client) -> Result<(String, String), Box<dyn std::error::Error>> {
     let passwd = encode(PASS);
     let payload = format!("usrname={user}%40student.dhbw-mannheim.de&pass={passwd}&APPNAME=CampusNet&PRGNAME=LOGINCHECK&ARGUMENTS=clino%2Cusrname%2Cpass%2Cmenuno%2Cmenu_type%2Cbrowser%2Cplatform&clino=000000000000001&menuno=000324&menu_type=classic&browser=&platform=", user=USER, passwd=passwd);
@@ -63,12 +102,24 @@ async fn get_session(client: Client) -> Result<(String, String), Box<dyn std::er
     Ok((String::from(cookie), String::from(session)))
 }
 
+/// It sends a GET request to the Dualis server, which returns the grades of the current semester
+///
+/// Arguments:
+///
+/// * `client`: The client that is used to send the request.
+/// * `cookie`: The cookie you got from the login request
+/// * `session`: The session id of the user.
+/// * `semester_id`: The semester id of the semester you want to get the grades from.
+///
+/// Returns:
+///
+/// A String of html
 async fn get_grades(
     client: Client,
     cookie: &str,
     session: &str,
     semester_id: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error>> {
     let response = client.get(format!("https://dualis.dhbw.de/scripts/mgrqispi.dll?APPNAME=CampusNet&PRGNAME=COURSERESULTS&ARGUMENTS={session},-N000307,{semester_id}", session=session, semester_id=semester_id))
         .headers(get_headers(HeaderType::Necessary))
         .header("Cookie", cookie)
@@ -76,10 +127,11 @@ async fn get_grades(
         .await?
         .text()
         .await?;
-    Ok(response)
+    Ok(parse_grades(&response)?)
 }
+
 /// Parses the grades from an HTML Response
-fn parse_grades(html: &str) -> Result<Vec<(String, Option<String>)>, Box<dyn Error>> {
+fn parse_grades(html: &str) -> Result<HashMap<String, Option<String>>, Box<dyn Error>> {
     let table = table_extract::Table::find_first(html).unwrap();
     let rows = table.iter();
     let mut grades = vec![];
@@ -92,16 +144,16 @@ fn parse_grades(html: &str) -> Result<Vec<(String, Option<String>)>, Box<dyn Err
             .collect();
         grades.push((row_slice[1].clone(), row_slice[2].clone()));
     });
-    let mut parsed_grades = vec![];
+    let mut parsed_grades: HashMap<String, Option<String>> = HashMap::new();
     for grade in grades.iter().skip(1) {
-        parsed_grades.push((
+        parsed_grades.insert(
             grade.0.clone(),
             if let Some(grade_position) = grade.1.find(",") {
                 Some(grade.1[grade_position - 1..grade_position + 2].to_string())
             } else {
                 None
             },
-        ));
+        );
     }
     Ok(parsed_grades)
 }
@@ -164,18 +216,22 @@ fn get_headers(header_type: HeaderType) -> HeaderMap {
 /// Returns:
 ///
 /// A Result<(), Box<dyn Error>>
-async fn save_grades(semester_id: &str, grades: &Vec<(String, Option<String>)>) -> Result<(), Box<dyn Error>> {
+async fn save_grades(
+    semester_id: &str,
+    grades: &HashMap<String, Option<String>>,
+) -> Result<(), Box<dyn Error>> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .open(format!("{}.json", semester_id))
         .await
         .unwrap();
-    file.write_all(serde_json::to_string(grades).unwrap().as_bytes()).await?;
+    file.write_all(serde_json::to_string(grades).unwrap().as_bytes())
+        .await?;
     Ok(())
 }
 
-async fn load_grades(semester_id: &str) -> Result<Vec<(String, Option<String>)>, Box<dyn Error>> {
+async fn load_grades(semester_id: &str) -> Result<HashMap<String, Option<String>>, Box<dyn Error>> {
     let mut file = OpenOptions::new()
         .read(true)
         .open(format!("{}.json", semester_id))
@@ -202,7 +258,7 @@ mod tests {
     async fn test_get_grades() {
         let client = ClientBuilder::new().build().unwrap();
         let (cookie, session) = get_session(client.clone()).await.unwrap();
-        let grades = get_grades(client, &cookie, &session, "-N000000015098000")
+        get_grades(client, &cookie, &session, "-N000000015098000")
             .await
             .unwrap();
     }
@@ -219,10 +275,9 @@ mod tests {
         let semester_id = "-N000000015098000";
         let client = ClientBuilder::new().build().unwrap();
         let (cookie, session) = get_session(client.clone()).await.unwrap();
-        let grades = get_grades(client, &cookie, &session, semester_id)
+        let parsed_grades = get_grades(client, &cookie, &session, semester_id)
             .await
             .unwrap();
-        let parsed_grades = parse_grades(&grades).unwrap();
         save_grades(semester_id, &parsed_grades).await.unwrap();
         println!("{:?}", parsed_grades);
     }
@@ -231,5 +286,13 @@ mod tests {
         let semester_id = "-N000000015098000";
         let grades = load_grades(semester_id).await.unwrap();
         println!("{:?}", grades);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_get_differences() {
+        let semester_id = "-N000000015098000";
+        let client = ClientBuilder::new().build().unwrap();
+        let (cookie, session) = get_session(client.clone()).await.unwrap();
+        let differences = get_differences(semester_id, &cookie, &session).await;
+        println!("{:?}", differences);
     }
 }
